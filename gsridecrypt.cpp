@@ -67,6 +67,13 @@ typedef struct gs_ctl_input_hdr
     unsigned char data[ANYSIZE_ARRAY];
 } GS_CTL_INPUT_HDR, *PGS_CTL_INPUT_HDR;
 
+
+typedef struct gs_ctl_hdr
+{
+    unsigned short type;
+    unsigned char data[ANYSIZE_ARRAY];
+} GS_CTL_HDR, *PGS_CTL_HDR;
+
 #pragma pack(pop)
 
 char* hexStringToBytes(char* string)
@@ -80,6 +87,25 @@ char* hexStringToBytes(char* string)
         buf[i / 2] = (char)strtoul(byteStr, NULL, 16);
     }
     return buf;
+}
+
+void printBuffer(unsigned short type, bool toServer, unsigned char* buffer, int len)
+{
+    time_t timer;
+    char time_buffer[26];
+    struct tm* tm_info;
+
+    time(&timer);
+    tm_info = localtime(&timer);
+
+    strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    printf("%s: %s: Type %04x: ", time_buffer, toServer ? "Client -> Server" : "Server -> Client", type);
+    for (int i = 0; i < len; i++) {
+        printf("%02x ", buffer[i]);
+    }
+    printf("\n");
+    fflush(stdout);
 }
 
 int main(int argc, char* argv[])
@@ -157,7 +183,7 @@ int main(int argc, char* argv[])
         udp->udp_checksum = htons(udp->udp_checksum);
 
         // Skip non-ENET traffic
-        if (udp->dest_portno != 47999) {
+        if (udp->dest_portno != 47999 && udp->src_portno != 47999) {
             continue;
         }
 
@@ -168,42 +194,36 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        PGS_CTL_INPUT_HDR ctl = (PGS_CTL_INPUT_HDR)(enet + 1);
+        PGS_CTL_HDR ctl = (PGS_CTL_HDR)(enet + 1);
 
-        // Skip control data that's not PC input
-        if (ctl->type != 0x0206) {
+        // Skip frame stats data
+        if (ctl->type == 0x0207) {
             continue;
         }
 
-        ctl->length = htonl(ctl->length);
+        if (ctl->type == 0x0206) {
+            PGS_CTL_INPUT_HDR input = (PGS_CTL_INPUT_HDR)(enet + 1);
 
-        EVP_DecryptInit_ex(aes_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
-        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
-        EVP_DecryptInit_ex(aes_ctx, NULL, NULL, (const unsigned char*)riKey, currentAesIv);
+            input->length = htonl(input->length);
 
-        unsigned char plaintext[256];
-        len = sizeof(plaintext);
-        EVP_DecryptUpdate(aes_ctx, plaintext, &len, &ctl->data[16], ctl->length - 16); // Skip the tag
+            EVP_DecryptInit_ex(aes_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
+            EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
+            EVP_DecryptInit_ex(aes_ctx, NULL, NULL, (const unsigned char*)riKey, currentAesIv);
 
-        time_t timer;
-        char time_buffer[26];
-        struct tm* tm_info;
+            unsigned char plaintext[256];
+            len = sizeof(plaintext);
+            EVP_DecryptUpdate(aes_ctx, plaintext, &len, &input->data[16], input->length - 16); // Skip the tag
 
-        time(&timer);
-        tm_info = localtime(&timer);
+            printBuffer(input->type, udp->dest_portno == 47999, plaintext, len);
 
-        strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", tm_info);
-
-        printf("%s: ", time_buffer);
-        for (int i = 0; i < len; i++) {
-            printf("%02x ", plaintext[i]);
+            if (input->length >= 16 + sizeof(currentAesIv)) {
+                memcpy(currentAesIv,
+                    &input->data[input->length - sizeof(currentAesIv)],
+                    sizeof(currentAesIv));
+            }
         }
-        printf("\n");
-
-        if (ctl->length >= 16 + sizeof(currentAesIv)) {
-            memcpy(currentAesIv,
-                &ctl->data[ctl->length - sizeof(currentAesIv)],
-                sizeof(currentAesIv));
+        else {
+            printBuffer(ctl->type, udp->dest_portno == 47999, (PUCHAR)ctl, len - ((PUCHAR)ctl - (PUCHAR)buffer));
         }
     }
 }
