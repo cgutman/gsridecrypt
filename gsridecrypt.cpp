@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
 #include <Windows.h>
+#include <tlhelp32.h>
+#include <DbgHelp.h>
 
 #include <openssl/evp.h>
 
@@ -10,9 +12,15 @@
 
 #include <stdio.h>
 
+#define DUMP_PATH "C:\\Windows\\Temp\\NvStreamer.dmp"
+
+#define PREFIX_SUFFIX_LEN 2
+#define KEY_LEN 16
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "libcrypto.lib")
 #pragma comment(lib, "libssl.lib")
+#pragma comment(lib, "Dbghelp.lib")
 
 #pragma pack(push, 1)
 
@@ -76,15 +84,15 @@ typedef struct gs_ctl_hdr
 
 #pragma pack(pop)
 
-char* hexStringToBytes(char* string)
+unsigned char* hexStringToBytes(char* string)
 {
-    char* buf = (char*)malloc(strlen(string) / 2);
+    unsigned char* buf = (unsigned char*)malloc(strlen(string) / 2);
     for (unsigned int i = 0; i < strlen(string); i += 2) {
         char byteStr[3];
 
         strncpy(byteStr, &string[i], 2);
 
-        buf[i / 2] = (char)strtoul(byteStr, NULL, 16);
+        buf[i / 2] = (unsigned char)strtoul(byteStr, NULL, 16);
     }
     return buf;
 }
@@ -108,12 +116,138 @@ void printBuffer(unsigned short type, bool toServer, unsigned char* buffer, int 
     fflush(stdout);
 }
 
+unsigned char* readFileToBuffer(const char* filePath, size_t* fileSize = NULL) {
+    FILE* file = fopen(filePath, "rb");
+    if (!file) {
+        fprintf(stderr, "Failed to open %s\n", filePath);
+        return NULL;
+    }
+
+    fseek(file, 0, SEEK_END);
+    size_t size = ftell(file);
+    rewind(file);
+
+    unsigned char* buf = (unsigned char*)malloc(size);
+    fread(buf, 1, size, file);
+    fclose(file);
+
+    if (fileSize != NULL) {
+        *fileSize = size;
+    }
+
+    return buf;
+}
+
+unsigned char* extractRiKey() {
+    printf("Attempting to extract RI key from current streaming session\n");
+
+    // First open the NvStreamerCurrent.log to pull the prefix and suffix of the RI key
+    char* streamerLogData = (char*)readFileToBuffer("C:\\ProgramData\\NVIDIA Corporation\\NvStream\\NvStreamerCurrent.log");
+    if (streamerLogData == NULL) {
+        exit(-1);
+    }
+
+    // Find the log line that contains the redacted key
+    const char* linePrefix = "SESSION_PARAMETER_RI_ENCRYPTION_KEY: ";
+    char* keyString = strstr(streamerLogData, linePrefix);
+    if (keyString == NULL) {
+        fprintf(stderr, "No SESSION_PARAMETER_RI_ENCRYPTION_KEY found!\n");
+        exit(-1);
+    }
+
+    // Skip the line prefix
+    keyString += strlen(linePrefix);
+
+    // Terminate the key line at the first space
+    *strstr(keyString, " ") = 0;
+
+    // Extract the prefix (prior to the ..)
+    char* keyPrefixStr = strtok(keyString, ".");
+    unsigned char* keyPrefix = hexStringToBytes(keyPrefixStr);
+
+    // Extract the suffix (after the ..)
+    char* keySuffixStr = strtok(NULL, ".");
+    unsigned char* keySuffix = hexStringToBytes(keySuffixStr);
+
+    printf("Found redacted RI key in NvStreamer log: %02X%02X ... %02X%02X\n",
+        keyPrefix[0], keyPrefix[1],
+        keySuffix[0], keySuffix[1]);
+
+    free(streamerLogData);
+
+    HANDLE processSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    PROCESSENTRY32 procEntry;
+    Process32First(processSnapshot, &procEntry);
+
+    // Find the PID of NvStreamer.exe
+    do {
+        if (strstr(procEntry.szExeFile, "nvstreamer.exe") != NULL) {
+            HANDLE processHandle = OpenProcess(GENERIC_READ, FALSE, procEntry.th32ProcessID);
+            if (processHandle == NULL) {
+                fprintf(stderr, "Unable to open handle to nvstreamer.exe\n");
+                exit(-1);
+            }
+
+            printf("Found nvstreamer.exe with PID %d\n", procEntry.th32ProcessID);
+
+            // Create a dump file
+            HANDLE dumpFileHandle = CreateFileA(DUMP_PATH, GENERIC_ALL, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+            if (dumpFileHandle == INVALID_HANDLE_VALUE) {
+                fprintf(stderr, "Failed to create dump file: %d\n", GetLastError());
+                exit(-1);
+            }
+
+            printf("Dumping NvStreamer.exe process memory...");
+            if (!MiniDumpWriteDump(processHandle, procEntry.th32ProcessID, dumpFileHandle, MiniDumpWithPrivateReadWriteMemory, NULL, NULL, NULL)) {
+                fprintf(stderr, "Failed to write nvstreamer.exe dump: %x\n", GetLastError());
+                exit(-1);
+            }
+            printf("done\n");
+
+            CloseHandle(processHandle);
+            CloseHandle(dumpFileHandle);
+
+            // Search the dump file for the prefix and suffix
+            size_t dumpSize;
+            unsigned char* dumpData = readFileToBuffer(DUMP_PATH, &dumpSize);
+            for (size_t j = 0; j < dumpSize - KEY_LEN; j++) {
+                // Check for the prefix to match
+                if (memcmp(keyPrefix, &dumpData[j], PREFIX_SUFFIX_LEN) == 0) {
+                    // Check for the suffix to match
+                    if (memcmp(keySuffix, &dumpData[j + KEY_LEN - PREFIX_SUFFIX_LEN], PREFIX_SUFFIX_LEN) == 0) {
+                        // Found it!
+                        unsigned char* key = (unsigned char*)malloc(KEY_LEN);
+                        memcpy(key, &dumpData[j], KEY_LEN);
+
+                        printf("RI Key: ");
+                        for (int k = 0; k < KEY_LEN; k++) {
+                            printf("%02X", key[k]);
+                        }
+                        printf("\n");
+
+                        free(dumpData);
+                        return key;
+                    }
+                }
+            }
+
+            fprintf(stderr, "No matching key found in NvStreamer.exe memory!\n");
+            free(dumpData);
+            break;
+        }
+    } while (Process32Next(processSnapshot, &procEntry));
+
+    fprintf(stderr, "NvStreamer.exe is not running!\n");
+    exit(-1);
+}
+
 int main(int argc, char* argv[])
 {
     WSADATA startupData;
 
-    if (argc != 3) {
-        printf("Usage: gsridecrypt <local interface address> <ri key>\n");
+    if (argc != 2) {
+        printf("Usage: gsridecrypt <local interface address>\n");
         return -1;
     }
 
@@ -149,7 +283,7 @@ int main(int argc, char* argv[])
 
     EVP_CIPHER_CTX* aes_ctx = EVP_CIPHER_CTX_new();
 
-    char* riKey = hexStringToBytes(argv[2]);
+    unsigned char* riKey = extractRiKey();
     unsigned char currentAesIv[16];
 
     // NB: The below parsing logic doesn't take enough precaution with untrusted input.
