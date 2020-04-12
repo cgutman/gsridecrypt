@@ -201,6 +201,11 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        // Skip loss stats data
+        if (ctl->type == 0x0201) {
+            continue;
+        }
+
         if (ctl->type == 0x0206) {
             PGS_CTL_INPUT_HDR input = (PGS_CTL_INPUT_HDR)(enet + 1);
 
