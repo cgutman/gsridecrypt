@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <tlhelp32.h>
 #include <DbgHelp.h>
+#include <ProcessSnapshot.h>
 
 #include <openssl/evp.h>
 
@@ -138,6 +139,21 @@ unsigned char* readFileToBuffer(const char* filePath, size_t* fileSize = NULL) {
     return buf;
 }
 
+BOOL CALLBACK MiniDumpWriteDumpCallback(
+    __in     PVOID CallbackParam,
+    __in     const PMINIDUMP_CALLBACK_INPUT CallbackInput,
+    __inout  PMINIDUMP_CALLBACK_OUTPUT CallbackOutput
+)
+{
+    switch (CallbackInput->CallbackType)
+    {
+    case IsProcessSnapshotCallback:
+        CallbackOutput->Status = S_FALSE;
+        break;
+    }
+    return TRUE;
+}
+
 unsigned char* extractRiKey() {
     printf("Attempting to extract RI key from current streaming session\n");
 
@@ -183,7 +199,7 @@ unsigned char* extractRiKey() {
     // Find the PID of NvStreamer.exe
     do {
         if (strstr(procEntry.szExeFile, "nvstreamer.exe") != NULL) {
-            HANDLE processHandle = OpenProcess(GENERIC_READ, FALSE, procEntry.th32ProcessID);
+            HANDLE processHandle = OpenProcess(GENERIC_ALL, FALSE, procEntry.th32ProcessID);
             if (processHandle == NULL) {
                 fprintf(stderr, "Unable to open handle to nvstreamer.exe\n");
                 exit(-1);
@@ -198,13 +214,26 @@ unsigned char* extractRiKey() {
                 exit(-1);
             }
 
-            printf("Dumping NvStreamer.exe process memory...");
-            if (!MiniDumpWriteDump(processHandle, procEntry.th32ProcessID, dumpFileHandle, MiniDumpWithPrivateReadWriteMemory, NULL, NULL, NULL)) {
+            printf("Capturing a snapshot of nvstreamer...");
+            HPSS pssSnapshot;
+            DWORD error = PssCaptureSnapshot(processHandle, PSS_CAPTURE_VA_CLONE | PSS_CREATE_BREAKAWAY, 0, &pssSnapshot);
+            if (error != NO_ERROR) {
+                fprintf(stderr, "Failed to snapshot nvstreamer.exe: %d\n", error);
+                exit(-1);
+            }
+            printf("done\n");
+
+            printf("Dumping NvStreamer.exe process memory from snapshot...");
+            MINIDUMP_CALLBACK_INFORMATION callbackInfo;
+            callbackInfo.CallbackRoutine = MiniDumpWriteDumpCallback;
+            callbackInfo.CallbackParam = NULL;
+            if (!MiniDumpWriteDump((HANDLE)pssSnapshot, procEntry.th32ProcessID, dumpFileHandle, MiniDumpWithPrivateReadWriteMemory, NULL, NULL, &callbackInfo)) {
                 fprintf(stderr, "Failed to write nvstreamer.exe dump: %x\n", GetLastError());
                 exit(-1);
             }
             printf("done\n");
 
+            PssFreeSnapshot(GetCurrentProcess(), pssSnapshot);
             CloseHandle(processHandle);
             CloseHandle(dumpFileHandle);
 
