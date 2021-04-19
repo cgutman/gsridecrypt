@@ -68,20 +68,19 @@ typedef struct enet_hdr
     unsigned short data_len;
 } ENET_HDR, *PENET_HDR;
 
-typedef struct gs_ctl_input_hdr
+typedef struct gs_enc_ctl_hdr
+{
+    unsigned short encryptedType; // Always 0x0001
+    unsigned short length;
+    unsigned int seq; // Used for IV
+    unsigned char tag[16]; // GCM authentication tag
+} GS_ENC_CTL_HDR, *PGS_ENC_CTL_HDR;
+
+typedef struct gs_ctl_hdr_v2
 {
     unsigned short type;
-    unsigned short unused; // Moonlight doesn't send this field but Shield Hub does?
-    unsigned int length;
-    unsigned char data[ANYSIZE_ARRAY];
-} GS_CTL_INPUT_HDR, *PGS_CTL_INPUT_HDR;
-
-
-typedef struct gs_ctl_hdr
-{
-    unsigned short type;
-    unsigned char data[ANYSIZE_ARRAY];
-} GS_CTL_HDR, *PGS_CTL_HDR;
+    unsigned short payloadLength;
+} GS_CTL_HDR_V2, *PGS_CTL_HDR_V2;
 
 #pragma pack(pop)
 
@@ -98,7 +97,7 @@ unsigned char* hexStringToBytes(char* string)
     return buf;
 }
 
-void printBuffer(unsigned short type, bool toServer, unsigned char* buffer, int len)
+void printBuffer(unsigned short type, unsigned short length, bool toServer, unsigned char* buffer)
 {
     time_t timer;
     char time_buffer[26];
@@ -109,8 +108,8 @@ void printBuffer(unsigned short type, bool toServer, unsigned char* buffer, int 
 
     strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    printf("%s: %s: Type %04x: ", time_buffer, toServer ? "Client -> Server" : "Server -> Client", type);
-    for (int i = 0; i < len; i++) {
+    printf("%s: %s: Type %04x (Length: %d bytes): ", time_buffer, toServer ? "Client -> Server" : "Server -> Client", type, length);
+    for (int i = 0; i < length; i++) {
         printf("%02x ", buffer[i]);
     }
     printf("\n");
@@ -313,11 +312,10 @@ int main(int argc, char* argv[])
     EVP_CIPHER_CTX* aes_ctx = EVP_CIPHER_CTX_new();
 
     unsigned char* riKey = extractRiKey();
-    unsigned char currentAesIv[16];
 
     // NB: The below parsing logic doesn't take enough precaution with untrusted input.
     // It's only designed for more quickly identifying changes in the GameStream
-    // remote input protocol with a trusted server over a private connection.
+    // protocol with a trusted server over a private connection.
     char buffer[1500];
     for (;;) {
         sinLen = sizeof(sin);
@@ -357,42 +355,36 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        PGS_CTL_HDR ctl = (PGS_CTL_HDR)(enet + 1);
+        PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)(enet + 1);
 
-        // Skip frame stats data
-        if (ctl->type == 0x0207) {
+        if (encCtl->encryptedType != 0x0001) {
+            printf("Unknown packet type: 0x%04x\n", encCtl->encryptedType);
             continue;
         }
 
-        // Skip loss stats data
-        if (ctl->type == 0x0201) {
+        unsigned char iv[16] = {};
+        iv[0] = (unsigned char)encCtl->seq;
+
+        EVP_CIPHER_CTX_reset(aes_ctx);
+        EVP_DecryptInit_ex(aes_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
+        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
+        EVP_DecryptInit_ex(aes_ctx, NULL, NULL, (const unsigned char*)riKey, iv);
+
+        unsigned char plaintext[1024];
+        len = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
+        EVP_DecryptUpdate(aes_ctx, plaintext, &len, (unsigned char*)(encCtl + 1), len);
+
+        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_TAG, sizeof(encCtl->tag), encCtl->tag);
+
+        if (EVP_DecryptFinal_ex(aes_ctx, plaintext, &len) != 1) {
+            printf("Decryption failed!\n");
+            DebugBreak();
             continue;
         }
 
-        if (ctl->type == 0x0206) {
-            PGS_CTL_INPUT_HDR input = (PGS_CTL_INPUT_HDR)(enet + 1);
+        PGS_CTL_HDR_V2 ctl = (PGS_CTL_HDR_V2)plaintext;
 
-            input->length = htonl(input->length);
-
-            EVP_DecryptInit_ex(aes_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
-            EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
-            EVP_DecryptInit_ex(aes_ctx, NULL, NULL, (const unsigned char*)riKey, currentAesIv);
-
-            unsigned char plaintext[256];
-            len = sizeof(plaintext);
-            EVP_DecryptUpdate(aes_ctx, plaintext, &len, &input->data[16], input->length - 16); // Skip the tag
-
-            printBuffer(input->type, udp->dest_portno == 47999, plaintext, len);
-
-            if (input->length >= 16 + sizeof(currentAesIv)) {
-                memcpy(currentAesIv,
-                    &input->data[input->length - sizeof(currentAesIv)],
-                    sizeof(currentAesIv));
-            }
-        }
-        else {
-            printBuffer(ctl->type, udp->dest_portno == 47999, (PUCHAR)ctl, len - ((PUCHAR)ctl - (PUCHAR)buffer));
-        }
+        printBuffer(ctl->type, sizeof(*ctl) + ctl->payloadLength, udp->dest_portno == 47999, plaintext);
     }
 }
 
