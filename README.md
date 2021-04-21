@@ -1,5 +1,5 @@
-# GameStream Remote Input Decrypting Tool
+# GameStream Control Stream Decryption Tool
 
-Given the remote input key from the GameStream launch or resume request, this utility will dump the plaintext input packets in real time for analysis.
+This tool will extract the RI encryption key from Nvstreamer's memory and dump the plaintext control packets in real time for analysis.
 
-Usage: `gsridecrypt <interface IP address> <rikey hex string>`
+Usage: `gsridecrypt <interface IP address>`
