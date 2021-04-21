@@ -452,7 +452,7 @@ int main(int argc, char* argv[])
         ENetProtocolCommandHeader* enetCmdHdr = (ENetProtocolCommandHeader*)(enetProtoHeader + 1);
 
         // Skip packets that aren't reliable sends on channel 0
-        if (enetCmdHdr->command != 0x86 || enetCmdHdr->channelID != 0) {
+        if ((enetCmdHdr->command & ENET_PROTOCOL_COMMAND_MASK) != ENET_PROTOCOL_COMMAND_SEND_RELIABLE || enetCmdHdr->channelID != 0) {
             continue;
         }
 
