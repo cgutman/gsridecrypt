@@ -5,6 +5,8 @@
 #include <DbgHelp.h>
 #include <ProcessSnapshot.h>
 
+#include <enet/protocol.h>
+
 #include <openssl/evp.h>
 
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -55,18 +57,6 @@ typedef struct udp_hdr
     unsigned short udp_length;       // Udp packet length
     unsigned short udp_checksum;     // Udp checksum
 } UDP_HDR, *PUDP_HDR;
-
-// This is specifically for the reliable send command
-typedef struct enet_hdr
-{
-    unsigned short peer_id;
-    unsigned short sent_time;
-    unsigned char command;
-
-    unsigned char channel_id;
-    unsigned short seq_num;
-    unsigned short data_len;
-} ENET_HDR, *PENET_HDR;
 
 typedef struct gs_enc_ctl_hdr
 {
@@ -455,14 +445,20 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        PENET_HDR enet = (PENET_HDR)(udp + 1);
+        // There is a transport layer protocol header that we want to skip
+        ENetProtocolHeader* enetProtoHeader = (ENetProtocolHeader*)(udp + 1);
+
+        // The application layer header starts here
+        ENetProtocolCommandHeader* enetCmdHdr = (ENetProtocolCommandHeader*)(enetProtoHeader + 1);
 
         // Skip packets that aren't reliable sends on channel 0
-        if (enet->command != 0x86 || enet->channel_id != 0) {
+        if (enetCmdHdr->command != 0x86 || enetCmdHdr->channelID != 0) {
             continue;
         }
 
-        PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)(enet + 1);
+        ENetProtocolSendReliable* enetRelHdr = (ENetProtocolSendReliable*)enetCmdHdr;
+
+        PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)(enetRelHdr + 1);
 
         if (encCtl->encryptedType != 0x0001) {
             printf("Unknown packet type: 0x%04x\n", encCtl->encryptedType);
