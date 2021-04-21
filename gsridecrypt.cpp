@@ -153,22 +153,60 @@ BOOL CALLBACK MiniDumpWriteDumpCallback(
     return TRUE;
 }
 
+void waitForNvStreamer() {
+    bool foundNvStreamer = false;
+
+    printf("Waiting for NvStreamer to start...");
+    while (!foundNvStreamer) {
+        // Poll each second for Nvstreamer.exe
+        Sleep(1000);
+
+        HANDLE processSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+        PROCESSENTRY32 procEntry;
+        Process32First(processSnapshot, &procEntry);
+
+        // Find the PID of NvStreamer.exe
+        do {
+            if (strstr(procEntry.szExeFile, "nvstreamer.exe") != NULL) {
+                printf("done\n");
+                foundNvStreamer = true;
+                break;
+            }
+        } while (Process32Next(processSnapshot, &procEntry));
+
+        CloseHandle(processSnapshot);
+    }
+}
+
 unsigned char* extractRiKey() {
+    // Wait for NvStreamer to start before proceeding with RI key extraction
+    waitForNvStreamer();
+
     printf("Attempting to extract RI key from current streaming session\n");
 
-    // First open the NvStreamerCurrent.log to pull the prefix and suffix of the RI key
-    char* streamerLogData = (char*)readFileToBuffer("C:\\ProgramData\\NVIDIA Corporation\\NvStream\\NvStreamerCurrent.log");
-    if (streamerLogData == NULL) {
-        exit(-1);
-    }
-
-    // Find the log line that contains the redacted key
+    char* keyString = NULL;
+    char* streamerLogData = NULL;
     const char* linePrefix = "SESSION_PARAMETER_RI_ENCRYPTION_KEY: ";
-    char* keyString = strstr(streamerLogData, linePrefix);
-    if (keyString == NULL) {
-        fprintf(stderr, "No SESSION_PARAMETER_RI_ENCRYPTION_KEY found!\n");
-        exit(-1);
-    }
+
+    do {
+        // Give NvStreamer some time to write these log entries
+        Sleep(1000);
+
+        // First open the NvStreamerCurrent.log to pull the prefix and suffix of the RI key
+        streamerLogData = (char*)readFileToBuffer("C:\\ProgramData\\NVIDIA Corporation\\NvStream\\NvStreamerCurrent.log");
+        if (streamerLogData == NULL) {
+            continue;
+        }
+
+        // Find the log line that contains the redacted key
+        keyString = strstr(streamerLogData, linePrefix);
+        if (keyString == NULL) {
+            fprintf(stderr, "No SESSION_PARAMETER_RI_ENCRYPTION_KEY found yet!\n");
+            free(streamerLogData);
+            continue;
+        }
+    } while (keyString == NULL);
 
     // Skip the line prefix
     keyString += strlen(linePrefix);
@@ -262,12 +300,80 @@ unsigned char* extractRiKey() {
 
             fprintf(stderr, "No matching key found in NvStreamer.exe memory!\n");
             free(dumpData);
-            break;
+            exit(-1);
         }
     } while (Process32Next(processSnapshot, &procEntry));
 
     fprintf(stderr, "NvStreamer.exe is not running!\n");
     exit(-1);
+}
+
+typedef struct _data_entry {
+    struct _data_entry* next;
+
+    bool toServer;
+    GS_ENC_CTL_HDR hdr;
+    // Payload data
+} DATA_ENTRY, *PDATA_ENTRY;
+
+static HANDLE g_DataReadyEvent;
+static CRITICAL_SECTION g_DataListLock;
+static PDATA_ENTRY g_DataListHead;
+static PDATA_ENTRY g_DataListTail;
+
+DWORD WINAPI DecryptionThreadProc(LPVOID) {
+    EVP_CIPHER_CTX* aes_ctx = EVP_CIPHER_CTX_new();
+
+    // While the extraction is happening, early packets
+    // will queue up so we don't miss any.
+    unsigned char* riKey = extractRiKey();
+
+    for (;;) {
+        WaitForSingleObject(g_DataReadyEvent, INFINITE);
+
+        EnterCriticalSection(&g_DataListLock);
+        PDATA_ENTRY dataEntry = g_DataListHead;
+        if (g_DataListHead == nullptr) {
+            g_DataListTail = nullptr;
+            ResetEvent(g_DataReadyEvent);
+            LeaveCriticalSection(&g_DataListLock);
+            continue;
+        }
+        g_DataListHead = dataEntry->next;
+        if (g_DataListHead == nullptr) {
+            g_DataListTail = nullptr;
+            ResetEvent(g_DataReadyEvent);
+        }
+        LeaveCriticalSection(&g_DataListLock);
+
+        PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)&dataEntry->hdr;
+
+        unsigned char iv[16] = {};
+        iv[0] = (unsigned char)encCtl->seq;
+
+        EVP_CIPHER_CTX_reset(aes_ctx);
+        EVP_DecryptInit_ex(aes_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
+        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
+        EVP_DecryptInit_ex(aes_ctx, NULL, NULL, (const unsigned char*)riKey, iv);
+
+        unsigned char plaintext[1024];
+        int len = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
+        EVP_DecryptUpdate(aes_ctx, plaintext, &len, (unsigned char*)(encCtl + 1), len);
+
+        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_TAG, sizeof(encCtl->tag), encCtl->tag);
+
+        if (EVP_DecryptFinal_ex(aes_ctx, plaintext, &len) != 1) {
+            printf("Decryption failed!\n");
+            DebugBreak();
+            free(dataEntry);
+            continue;
+        }
+
+        PGS_CTL_HDR_V2 ctl = (PGS_CTL_HDR_V2)plaintext;
+
+        printBuffer(ctl->type, sizeof(*ctl) + ctl->payloadLength, dataEntry->toServer, plaintext);
+        free(dataEntry);
+    }
 }
 
 int main(int argc, char* argv[])
@@ -282,6 +388,9 @@ int main(int argc, char* argv[])
     WSAStartup(MAKEWORD(2, 2), &startupData);
 
     SOCKET s;
+
+    g_DataReadyEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    InitializeCriticalSection(&g_DataListLock);
 
     s = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
     if (s == INVALID_SOCKET) {
@@ -309,9 +418,7 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    EVP_CIPHER_CTX* aes_ctx = EVP_CIPHER_CTX_new();
-
-    unsigned char* riKey = extractRiKey();
+    CreateThread(NULL, 0, DecryptionThreadProc, NULL, 0, NULL);
 
     // NB: The below parsing logic doesn't take enough precaution with untrusted input.
     // It's only designed for more quickly identifying changes in the GameStream
@@ -362,29 +469,23 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        unsigned char iv[16] = {};
-        iv[0] = (unsigned char)encCtl->seq;
+        int payloadLength = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
+        PDATA_ENTRY dataEntry = (PDATA_ENTRY)malloc(sizeof(*dataEntry) + payloadLength);
 
-        EVP_CIPHER_CTX_reset(aes_ctx);
-        EVP_DecryptInit_ex(aes_ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
-        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL);
-        EVP_DecryptInit_ex(aes_ctx, NULL, NULL, (const unsigned char*)riKey, iv);
+        dataEntry->next = nullptr;
+        dataEntry->toServer = (udp->dest_portno == 47999);
+        RtlCopyMemory(&dataEntry->hdr, encCtl, sizeof(*encCtl) + payloadLength);
 
-        unsigned char plaintext[1024];
-        len = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
-        EVP_DecryptUpdate(aes_ctx, plaintext, &len, (unsigned char*)(encCtl + 1), len);
-
-        EVP_CIPHER_CTX_ctrl(aes_ctx, EVP_CTRL_GCM_SET_TAG, sizeof(encCtl->tag), encCtl->tag);
-
-        if (EVP_DecryptFinal_ex(aes_ctx, plaintext, &len) != 1) {
-            printf("Decryption failed!\n");
-            DebugBreak();
-            continue;
+        EnterCriticalSection(&g_DataListLock);
+        if (g_DataListTail == nullptr) {
+            g_DataListHead = dataEntry;
         }
-
-        PGS_CTL_HDR_V2 ctl = (PGS_CTL_HDR_V2)plaintext;
-
-        printBuffer(ctl->type, sizeof(*ctl) + ctl->payloadLength, udp->dest_portno == 47999, plaintext);
+        else {
+            g_DataListTail->next = dataEntry;
+        }
+        g_DataListTail = dataEntry;
+        LeaveCriticalSection(&g_DataListLock);
+        SetEvent(g_DataReadyEvent);
     }
 }
 
