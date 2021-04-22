@@ -481,6 +481,14 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        unsigned short enetDataLength = htons(enetRelHdr->dataLength);
+        if (enetDataLength != offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length) {
+            printf("Data length mismatch: %d vs %zd\n",
+                enetDataLength,
+                offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length);
+            continue;
+        }
+
         int payloadLength = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
         PDATA_ENTRY dataEntry = (PDATA_ENTRY)malloc(sizeof(*dataEntry) + payloadLength);
 
