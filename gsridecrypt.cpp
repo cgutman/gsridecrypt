@@ -455,8 +455,17 @@ int main(int argc, char* argv[])
         // There is a transport layer protocol header that we want to skip
         ENetProtocolHeader* enetProtoHeader = (ENetProtocolHeader*)(udp + 1);
 
+        unsigned short peerID = htons(enetProtoHeader->peerID);
+        int protoHeaderSize =
+            (peerID & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME) ? sizeof(*enetProtoHeader) : offsetof(ENetProtocolHeader, sentTime);
+
+        if (peerID & ENET_PROTOCOL_HEADER_FLAG_COMPRESSED) {
+            printf("ENet message was compressed! This is unsupported!\n");
+            continue;
+        }
+
         // The application layer header starts here
-        ENetProtocolCommandHeader* enetCmdHdr = (ENetProtocolCommandHeader*)(enetProtoHeader + 1);
+        ENetProtocolCommandHeader* enetCmdHdr = (ENetProtocolCommandHeader*)((unsigned char*)enetProtoHeader + protoHeaderSize);
 
         // Skip packets that aren't reliable sends on channel 0
         if ((enetCmdHdr->command & ENET_PROTOCOL_COMMAND_MASK) != ENET_PROTOCOL_COMMAND_SEND_RELIABLE || enetCmdHdr->channelID != 0) {
