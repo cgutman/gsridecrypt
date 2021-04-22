@@ -415,15 +415,17 @@ int main(int argc, char* argv[])
     // protocol with a trusted server over a private connection.
     char buffer[1500];
     for (;;) {
+        bool truncated = false;
+
         sinLen = sizeof(sin);
         int len = recvfrom(s, buffer, sizeof(buffer), 0, (sockaddr*)&sin, &sinLen);
-        if (len < 0 && WSAGetLastError() != WSAEMSGSIZE) {
-            printf("recvfrom() failed: %d\n", WSAGetLastError());
-            return -1;
+        if (len < 0 && WSAGetLastError() == WSAEMSGSIZE) {
+            // We'll check to make sure this isn't ENet traffic
+            truncated = true;
         }
         else if (len < 0) {
-            // Packet too large is fine
-            continue;
+            printf("recvfrom() failed: %d\n", WSAGetLastError());
+            return -1;
         }
 
         PIPV4_HDR ip = (PIPV4_HDR)buffer;
@@ -442,6 +444,11 @@ int main(int argc, char* argv[])
 
         // Skip non-ENET traffic
         if (udp->dest_portno != 47999 && udp->src_portno != 47999) {
+            continue;
+        }
+
+        if (truncated) {
+            printf("ENet message was truncated! Actual size of UDP datagram: %d\n", udp->udp_length);
             continue;
         }
 
