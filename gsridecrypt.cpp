@@ -87,7 +87,7 @@ unsigned char* hexStringToBytes(char* string)
     return buf;
 }
 
-void printBuffer(unsigned short type, unsigned short length, bool toServer, unsigned char* buffer)
+void printBuffer(unsigned short type, unsigned short length, bool toServer, unsigned char channelId, unsigned char* buffer)
 {
     time_t timer;
     char time_buffer[26];
@@ -98,7 +98,7 @@ void printBuffer(unsigned short type, unsigned short length, bool toServer, unsi
 
     strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    printf("%s: %s: Type %04x (Length: %d bytes): ", time_buffer, toServer ? "Client -> Server" : "Server -> Client", type, length);
+    printf("%s: %s: Channel %d: Type %04x (Length: %d bytes): ", time_buffer, toServer ? "Client -> Server" : "Server -> Client", channelId, type, length);
     for (int i = 0; i < length; i++) {
         printf("%02x ", buffer[i]);
     }
@@ -301,6 +301,7 @@ unsigned char* extractRiKey() {
 typedef struct _data_entry {
     struct _data_entry* next;
 
+    unsigned char channelId;
     bool toServer;
     GS_ENC_CTL_HDR hdr;
     // Payload data
@@ -361,7 +362,7 @@ DWORD WINAPI DecryptionThreadProc(LPVOID) {
 
         PGS_CTL_HDR_V2 ctl = (PGS_CTL_HDR_V2)plaintext;
 
-        printBuffer(ctl->type, sizeof(*ctl) + ctl->payloadLength, dataEntry->toServer, plaintext);
+        printBuffer(ctl->type, sizeof(*ctl) + ctl->payloadLength, dataEntry->toServer, dataEntry->channelId, plaintext);
         free(dataEntry);
     }
 }
@@ -493,6 +494,7 @@ int main(int argc, char* argv[])
         PDATA_ENTRY dataEntry = (PDATA_ENTRY)malloc(sizeof(*dataEntry) + payloadLength);
 
         dataEntry->next = nullptr;
+        dataEntry->channelId = enetCmdHdr->channelID;
         dataEntry->toServer = (udp->dest_portno == 47999);
         RtlCopyMemory(&dataEntry->hdr, encCtl, sizeof(*encCtl) + payloadLength);
 
