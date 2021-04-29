@@ -7,6 +7,9 @@
 
 #include <enet/protocol.h>
 
+// Nvidia custom command type with same structure as reliable send
+#define ENET_PROTOCOL_COMMAND_SEND_PARTIALLY_RELIABLE 13
+
 #include <openssl/evp.h>
 
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -367,6 +370,19 @@ DWORD WINAPI DecryptionThreadProc(LPVOID) {
     }
 }
 
+void queueDataEntry(PDATA_ENTRY dataEntry) {
+    EnterCriticalSection(&g_DataListLock);
+    if (g_DataListTail == nullptr) {
+        g_DataListHead = dataEntry;
+    }
+    else {
+        g_DataListTail->next = dataEntry;
+    }
+    g_DataListTail = dataEntry;
+    LeaveCriticalSection(&g_DataListLock);
+    SetEvent(g_DataReadyEvent);
+}
+
 int main(int argc, char* argv[])
 {
     WSADATA startupData;
@@ -468,46 +484,70 @@ int main(int argc, char* argv[])
         // The application layer header starts here
         ENetProtocolCommandHeader* enetCmdHdr = (ENetProtocolCommandHeader*)((unsigned char*)enetProtoHeader + protoHeaderSize);
 
-        // Skip packets that aren't reliable sends on channel 0
-        if ((enetCmdHdr->command & ENET_PROTOCOL_COMMAND_MASK) != ENET_PROTOCOL_COMMAND_SEND_RELIABLE || enetCmdHdr->channelID != 0) {
+        // Skip packets that aren't reliable or partially reliable sends
+        unsigned char command = (enetCmdHdr->command & ENET_PROTOCOL_COMMAND_MASK);
+        if (command != ENET_PROTOCOL_COMMAND_SEND_RELIABLE && command != ENET_PROTOCOL_COMMAND_SEND_PARTIALLY_RELIABLE) {
             continue;
         }
 
         ENetProtocolSendReliable* enetRelHdr = (ENetProtocolSendReliable*)enetCmdHdr;
 
-        PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)(enetRelHdr + 1);
-
-        if (encCtl->encryptedType != 0x0001) {
-            printf("Unknown packet type: 0x%04x\n", encCtl->encryptedType);
-            continue;
-        }
-
         unsigned short enetDataLength = htons(enetRelHdr->dataLength);
-        if (enetDataLength != offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length) {
-            printf("Data length mismatch: %d vs %zd\n",
-                enetDataLength,
-                offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length);
-            continue;
-        }
+        if (command == ENET_PROTOCOL_COMMAND_SEND_RELIABLE) {
+            PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)(enetRelHdr + 1);
 
-        int payloadLength = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
-        PDATA_ENTRY dataEntry = (PDATA_ENTRY)malloc(sizeof(*dataEntry) + payloadLength);
+            if (encCtl->encryptedType != 0x0001) {
+                printf("Unknown packet type: 0x%04x\n", encCtl->encryptedType);
+                continue;
+            }
 
-        dataEntry->next = nullptr;
-        dataEntry->channelId = enetCmdHdr->channelID;
-        dataEntry->toServer = (udp->dest_portno == 47999);
-        RtlCopyMemory(&dataEntry->hdr, encCtl, sizeof(*encCtl) + payloadLength);
+            // Reliable sends should only have one message inside
+            if (enetDataLength != offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length) {
+                printf("Data length mismatch: %d vs %zd\n",
+                    enetDataLength,
+                    offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length);
+                continue;
+            }
 
-        EnterCriticalSection(&g_DataListLock);
-        if (g_DataListTail == nullptr) {
-            g_DataListHead = dataEntry;
+            int payloadLength = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
+            PDATA_ENTRY dataEntry = (PDATA_ENTRY)malloc(sizeof(*dataEntry) + payloadLength);
+
+            dataEntry->next = nullptr;
+            dataEntry->channelId = enetCmdHdr->channelID;
+            dataEntry->toServer = (udp->dest_portno == 47999);
+            RtlCopyMemory(&dataEntry->hdr, encCtl, sizeof(*encCtl) + payloadLength);
+
+            queueDataEntry(dataEntry);
         }
         else {
-            g_DataListTail->next = dataEntry;
+            // Partially reliable contain batches of multiple messages
+            PGS_ENC_CTL_HDR encCtl = (PGS_ENC_CTL_HDR)(enetRelHdr + 1);
+            int lengthRemaining = enetDataLength;
+            do {
+                if (encCtl->encryptedType != 0x0001) {
+                    printf("Unknown packet type: 0x%04x\n", encCtl->encryptedType);
+                    break;
+                }
+
+                int payloadLength = encCtl->length - sizeof(encCtl->seq) - sizeof(encCtl->tag);
+                PDATA_ENTRY dataEntry = (PDATA_ENTRY)malloc(sizeof(*dataEntry) + payloadLength);
+
+                dataEntry->next = nullptr;
+                dataEntry->channelId = enetCmdHdr->channelID;
+                dataEntry->toServer = (udp->dest_portno == 47999);
+                RtlCopyMemory(&dataEntry->hdr, encCtl, sizeof(*encCtl) + payloadLength);
+
+                queueDataEntry(dataEntry);
+
+                lengthRemaining -= offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length;
+                if (lengthRemaining < 0) {
+                    printf("Data length underflow: %d\n", lengthRemaining);
+                    break;
+                }
+
+                encCtl = (PGS_ENC_CTL_HDR)((unsigned char*)encCtl + offsetof(GS_ENC_CTL_HDR, seq) + encCtl->length);
+            } while (lengthRemaining > 0);
         }
-        g_DataListTail = dataEntry;
-        LeaveCriticalSection(&g_DataListLock);
-        SetEvent(g_DataReadyEvent);
     }
 }
 
